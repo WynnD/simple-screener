@@ -447,27 +447,47 @@ def run_screen(max_workers: int = 6, progress_callback=None) -> list[dict]:
 
     # Phase 4: Score with fresh market caps
     results = []
+    pending = []
+    candidate_names = {c["symbol"]: c.get("name", c["symbol"]) for c in candidates}
+
     for sym in symbols:
-        if sym not in cached or sym not in market_caps:
-            continue
-        result = score_ticker(cached[sym], market_caps[sym])
-        if result:
-            results.append(result)
+        mc = market_caps.get(sym, 0)
+        if sym in cached:
+            result = score_ticker(cached[sym], mc)
+            if result:
+                results.append(result)
+        else:
+            # No fundamentals yet — show as pending
+            pending.append({
+                "symbol": sym,
+                "name": candidate_names.get(sym, sym),
+                "sector": "",
+                "industry": "",
+                "source": "pending",
+                "market_cap_b": round(mc / 1e9, 2) if mc else None,
+                "gross_margin_pct": None,
+                "fcf_margin_3y_avg_pct": None,
+                "p_fcf": None,
+                "revenue_cagr_pct": None,
+                "ebit_cagr_pct": None,
+                "net_debt_ebitda": None,
+            })
 
     results.sort(key=lambda x: x["p_fcf"])
 
     yahoo_fail_count = len(yahoo_failures)
     fmp_budget_left = _fmp_remaining()
     logger.info(
-        f"Screen complete: {len(results)} passed, "
+        f"Screen complete: {len(results)} passed, {len(pending)} pending, "
         f"{len(cached)}/{len(symbols)} have fundamentals, "
         f"{yahoo_fail_count} Yahoo failures, "
         f"FMP budget: {fmp_budget_left}/250 remaining"
     )
-    return results
+    return {"results": results, "pending": pending}
 
 
-def run_screen_cached(max_age_hours: int = 6, progress_callback=None) -> tuple[list[dict], str]:
+def run_screen_cached(max_age_hours: int = 1, progress_callback=None) -> tuple[dict, str]:
+    """Returns ({"results": [...], "pending": [...]}, timestamp)."""
     cache_file = CACHE_DIR / "results.json"
 
     if cache_file.exists():
@@ -478,7 +498,7 @@ def run_screen_cached(max_age_hours: int = 6, progress_callback=None) -> tuple[l
             logger.info(f"Using cached results from {ts}")
             return cached, ts
 
-    results = run_screen(progress_callback=progress_callback)
-    cache_file.write_text(json.dumps(results, indent=2))
+    data = run_screen(progress_callback=progress_callback)
+    cache_file.write_text(json.dumps(data, indent=2))
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-    return results, ts
+    return data, ts

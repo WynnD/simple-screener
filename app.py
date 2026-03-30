@@ -15,6 +15,7 @@ app = Flask(__name__)
 # In-memory state for background screening
 _state = {
     "results": None,
+    "pending": None,
     "timestamp": None,
     "running": False,
     "progress": 0,
@@ -31,8 +32,9 @@ def _run_background():
     _state["running"] = True
     _state["progress"] = 0
     try:
-        results, ts = run_screen_cached(max_age_hours=1, progress_callback=_progress_cb)
-        _state["results"] = results
+        data, ts = run_screen_cached(max_age_hours=1, progress_callback=_progress_cb)
+        _state["results"] = data.get("results", [])
+        _state["pending"] = data.get("pending", [])
         _state["timestamp"] = ts
     except Exception as e:
         logger.error(f"Screen failed: {e}")
@@ -111,9 +113,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .btn:disabled { opacity: 0.4; cursor: not-allowed; }
   .header-row { display: flex; align-items: center; gap: 1rem; margin-bottom: 0.25rem; }
   .count { color: var(--accent); font-weight: 600; }
+  .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
   @media (max-width: 900px) {
-    body { padding: 1rem; }
-    .name { display: none; }
+    body { padding: 0.75rem; }
+    table { font-size: 0.78rem; }
+    td, th { padding: 0.4rem 0.5rem; white-space: nowrap; }
   }
 </style>
 </head>
@@ -136,6 +140,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <p class="status" id="progress-text">Screening...</p>
     <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
   </div>
+  <div class="table-wrap">
   <table>
     <thead>
       <tr>
@@ -153,46 +158,57 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </thead>
     <tbody id="tbody"></tbody>
   </table>
+  </div>
 
 <script>
-let sortKey = 'p_fcf', sortAsc = true, data = [];
+let sortKey = 'p_fcf', sortAsc = true, data = [], pending = [];
 
-function escapeHtml(str) {
-  const div = document.createElement('div');
-  div.textContent = str;
-  return div.innerHTML;
+function fmt(val, suffix) {
+  if (val === null || val === undefined) return '\u2026';
+  return val.toFixed(suffix === 'x2' ? 2 : 1) + (suffix === 'x2' ? 'x' : suffix || '');
+}
+
+function renderRow(r, isPending) {
+  const tr = document.createElement('tr');
+  if (isPending) tr.style.opacity = '0.45';
+  const cells = [
+    { cls: 'sym', text: r.symbol },
+    { cls: 'name', text: r.name || '' },
+    { cls: 'name', text: r.sector || '' },
+    { cls: 'num', text: fmt(r.market_cap_b, '') },
+    { cls: 'num', text: fmt(r.gross_margin_pct, '%') },
+    { cls: 'num', text: fmt(r.fcf_margin_3y_avg_pct, '%') },
+    { cls: isPending ? 'num' : 'num good', text: fmt(r.p_fcf, 'x') },
+    { cls: 'num', text: fmt(r.revenue_cagr_pct, '%') },
+    { cls: 'num', text: fmt(r.ebit_cagr_pct, '%') },
+    { cls: 'num', text: fmt(r.net_debt_ebitda, 'x2') },
+  ];
+  cells.forEach(c => {
+    const td = document.createElement('td');
+    td.className = c.cls;
+    td.textContent = c.text;
+    tr.appendChild(td);
+  });
+  return tr;
 }
 
 function render() {
   const sorted = [...data].sort((a, b) => {
     let va = a[sortKey], vb = b[sortKey];
+    if (va == null && vb == null) return 0;
+    if (va == null) return 1;
+    if (vb == null) return -1;
     if (typeof va === 'string') return sortAsc ? va.localeCompare(vb) : vb.localeCompare(va);
     return sortAsc ? va - vb : vb - va;
   });
   const tbody = document.getElementById('tbody');
   tbody.textContent = '';
-  sorted.forEach(r => {
-    const tr = document.createElement('tr');
-    const cells = [
-      { cls: 'sym', text: r.symbol },
-      { cls: 'name', text: r.name },
-      { cls: 'name', text: r.sector },
-      { cls: 'num', text: r.market_cap_b.toFixed(1) },
-      { cls: 'num', text: r.gross_margin_pct.toFixed(1) + '%' },
-      { cls: 'num', text: r.fcf_margin_3y_avg_pct.toFixed(1) + '%' },
-      { cls: 'num good', text: r.p_fcf.toFixed(1) + 'x' },
-      { cls: 'num', text: r.revenue_cagr_pct.toFixed(1) + '%' },
-      { cls: 'num', text: r.ebit_cagr_pct.toFixed(1) + '%' },
-      { cls: 'num', text: r.net_debt_ebitda.toFixed(2) + 'x' },
-    ];
-    cells.forEach(c => {
-      const td = document.createElement('td');
-      td.className = c.cls;
-      td.textContent = c.text;
-      tr.appendChild(td);
-    });
-    tbody.appendChild(tr);
-  });
+  sorted.forEach(r => tbody.appendChild(renderRow(r, false)));
+
+  // Append pending rows at the bottom
+  if (pending.length > 0) {
+    pending.forEach(r => tbody.appendChild(renderRow(r, true)));
+  }
 
   document.querySelectorAll('th').forEach(th => {
     th.classList.remove('sorted-asc', 'sorted-desc');
@@ -225,8 +241,11 @@ async function poll() {
     document.getElementById('refresh').disabled = false;
     if (s.results) {
       data = s.results;
-      document.getElementById('meta').textContent =
-        data.length + ' stocks passing \u00b7 Updated ' + s.timestamp;
+      pending = s.pending || [];
+      let meta = data.length + ' stocks passing';
+      if (pending.length > 0) meta += ' \u00b7 ' + pending.length + ' awaiting data';
+      meta += ' \u00b7 Updated ' + s.timestamp;
+      document.getElementById('meta').textContent = meta;
       render();
     } else {
       document.getElementById('meta').textContent = 'No results yet. Click Refresh.';
@@ -257,6 +276,7 @@ def api_status():
         "progress": _state["progress"],
         "total": _state["total"],
         "results": _state["results"],
+        "pending": _state["pending"],
         "timestamp": _state["timestamp"],
     })
 
