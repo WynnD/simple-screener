@@ -304,7 +304,9 @@ poll();
 
 @app.route("/")
 def index():
-    return render_template_string(HTML_TEMPLATE)
+    resp = app.make_response(render_template_string(HTML_TEMPLATE))
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return resp
 
 
 @app.route("/api/status")
