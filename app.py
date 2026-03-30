@@ -5,7 +5,7 @@ import threading
 
 from flask import Flask, jsonify, render_template_string
 
-from screener import run_screen_cached
+from screener import run_screen_cached, CACHE_DIR
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -21,6 +21,23 @@ _state = {
     "progress": 0,
     "total": 0,
 }
+
+
+def _load_stale_cache():
+    """Load whatever results exist on disk, regardless of age."""
+    import json, time
+    from datetime import datetime
+    cache_file = CACHE_DIR / "results.json"
+    if cache_file.exists():
+        try:
+            data = json.loads(cache_file.read_text())
+            ts = datetime.fromtimestamp(cache_file.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+            _state["results"] = data.get("results", data if isinstance(data, list) else [])
+            _state["pending"] = data.get("pending", [])
+            _state["timestamp"] = ts
+            logger.info(f"Loaded stale cache: {len(_state['results'])} results from {ts}")
+        except Exception as e:
+            logger.error(f"Failed to load stale cache: {e}")
 
 
 def _progress_cb(done, total):
@@ -42,7 +59,9 @@ def _run_background():
         _state["running"] = False
 
 
-# Kick off initial screen on startup
+# Load cached results immediately so the UI has data right away
+_load_stale_cache()
+# Then refresh in background
 threading.Thread(target=_run_background, daemon=True).start()
 
 HTML_TEMPLATE = """<!DOCTYPE html>
