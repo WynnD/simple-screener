@@ -288,7 +288,7 @@ function exportCsv() {
     if (typeof v === 'string') return '"' + v.replace(/"/g, '""') + '"';
     return v;
   }).join(','));
-  const csv = [header.join(','), ...rows].join('\n');
+  const csv = [header.join(','), ...rows].join(String.fromCharCode(10));
   const blob = new Blob([csv], { type: 'text/csv' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
