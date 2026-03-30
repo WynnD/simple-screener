@@ -125,6 +125,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <div class="header-row">
     <h1>Stock Screener</h1>
     <button class="btn" id="refresh" onclick="refresh()">Refresh</button>
+    <button class="btn" onclick="exportCsv()">Export CSV</button>
   </div>
   <p class="subtitle" id="meta">Loading...</p>
   <div class="criteria">
@@ -256,6 +257,24 @@ async function poll() {
 async function refresh() {
   await fetch('/api/refresh', { method: 'POST' });
   poll();
+}
+
+function exportCsv() {
+  if (!data.length) return;
+  const cols = ['symbol','name','sector','market_cap_b','gross_margin_pct','fcf_margin_3y_avg_pct','p_fcf','revenue_cagr_pct','ebit_cagr_pct','net_debt_ebitda'];
+  const header = ['Ticker','Name','Sector','Mkt Cap ($B)','Gross Margin %','FCF Margin 3Y %','P/FCF','Rev CAGR 3Y %','EBIT CAGR 3Y %','ND/EBITDA'];
+  const rows = data.map(r => cols.map(c => {
+    const v = r[c];
+    if (v == null) return '';
+    if (typeof v === 'string') return '"' + v.replace(/"/g, '""') + '"';
+    return v;
+  }).join(','));
+  const csv = [header.join(','), ...rows].join('\n');
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'screener_' + new Date().toISOString().slice(0,10) + '.csv';
+  a.click();
 }
 
 poll();
