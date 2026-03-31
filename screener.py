@@ -82,9 +82,8 @@ def _fmp_get(endpoint: str, params: dict) -> dict | list | None:
         if r.status_code == 200:
             return r.json()
         if r.status_code == 429:
-            logger.warning(f"FMP rate limited, pausing 60s")
-            time.sleep(60)
-            return None
+            logger.warning(f"FMP rate limited")
+            return "RATE_LIMITED"
     except Exception:
         pass
     return None
@@ -283,22 +282,35 @@ def fetch_fundamentals_yahoo(symbol: str) -> dict | None:
         return None
 
 
-def fetch_fundamentals_fmp(symbol: str) -> dict | None:
-    """Fetch fundamentals from FMP. Costs ~5 API calls."""
-    if _fmp_remaining() < 5:
+def fetch_fundamentals_fmp(symbol: str) -> dict | str | None:
+    """Fetch fundamentals from FMP. Costs ~6 API calls.
+
+    Returns dict on success, "RATE_LIMITED" if throttled, None on data error.
+    """
+    if _fmp_remaining() < 6:
         return None
 
     profile = _fmp_get("profile", {"symbol": symbol})
+    if profile == "RATE_LIMITED":
+        return "RATE_LIMITED"
     if not profile or not isinstance(profile, list) or not profile:
         return None
     profile = profile[0]
 
     # Try financial statements
-    inc = _fmp_get("income-statement", {"symbol": symbol, "period": "annual", "limit": "4"})
-    cf = _fmp_get("cash-flow-statement", {"symbol": symbol, "period": "annual", "limit": "3"})
-    q_inc = _fmp_get("income-statement", {"symbol": symbol, "period": "quarter", "limit": "4"})
-    q_cf = _fmp_get("cash-flow-statement", {"symbol": symbol, "period": "quarter", "limit": "4"})
+    results = []
+    for ep, params in [
+        ("income-statement", {"symbol": symbol, "period": "annual", "limit": "4"}),
+        ("cash-flow-statement", {"symbol": symbol, "period": "annual", "limit": "3"}),
+        ("income-statement", {"symbol": symbol, "period": "quarter", "limit": "4"}),
+        ("cash-flow-statement", {"symbol": symbol, "period": "quarter", "limit": "4"}),
+    ]:
+        data = _fmp_get(ep, params)
+        if data == "RATE_LIMITED":
+            return "RATE_LIMITED"
+        results.append(data)
 
+    inc, cf, q_inc, q_cf = results
     if not all(isinstance(x, list) and x for x in [inc, cf, q_inc, q_cf]):
         return None
 
@@ -474,12 +486,17 @@ def run_screen(max_workers: int = 6, progress_callback=None) -> list[dict]:
         can_process = min(len(yahoo_failures), budget // 6)
         if can_process > 0:
             logger.info(f"FMP backfill: {can_process}/{len(yahoo_failures)} failures ({budget} calls remaining)")
+            fmp_successes = 0
             for sym in yahoo_failures[:can_process]:
                 data = fetch_fundamentals_fmp(sym)
-                if data:
+                if data == "RATE_LIMITED":
+                    logger.warning(f"FMP rate limited after {fmp_successes} tickers, stopping backfill")
+                    break
+                if isinstance(data, dict):
                     _save_fundamentals(sym, data)
                     cached[sym] = data
-                    yahoo_failures.remove(sym)
+                    fmp_successes += 1
+            logger.info(f"FMP backfill complete: {fmp_successes} tickers cached")
 
     # Phase 4: Score with fresh market caps
     results = []
