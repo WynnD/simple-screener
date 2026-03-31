@@ -64,15 +64,27 @@ def _fmp_increment(n: int = 1):
     _fmp_budget_file().write_text(json.dumps(b))
 
 
+_fmp_last_call = 0.0
+
 def _fmp_get(endpoint: str, params: dict) -> dict | list | None:
+    global _fmp_last_call
     if not FMP_API_KEY or _fmp_remaining() <= 0:
         return None
+    # Rate limit: max 5 calls/sec (FMP free tier limit)
+    elapsed = time.time() - _fmp_last_call
+    if elapsed < 0.3:
+        time.sleep(0.3 - elapsed)
     params["apikey"] = FMP_API_KEY
     try:
         r = requests.get(f"{FMP_BASE}/{endpoint}", params=params, timeout=10)
+        _fmp_last_call = time.time()
         _fmp_increment()
         if r.status_code == 200:
             return r.json()
+        if r.status_code == 429:
+            logger.warning(f"FMP rate limited, pausing 60s")
+            time.sleep(60)
+            return None
     except Exception:
         pass
     return None
@@ -411,32 +423,55 @@ def run_screen(max_workers: int = 6, progress_callback=None) -> list[dict]:
 
     logger.info(f"Cache: {len(cached)} hit, {len(missing)} miss")
 
-    # Phase 2: Fetch missing from Yahoo
+    # Phase 2: Fetch missing from Yahoo in batches to avoid rate limits
     completed = len(cached)
     total = len(symbols)
 
     if progress_callback:
         progress_callback(completed, total)
 
-    yahoo_failures = []
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(fetch_fundamentals_yahoo, sym): sym for sym in missing}
-        for future in as_completed(futures):
-            sym = futures[future]
-            completed += 1
-            if progress_callback:
-                progress_callback(completed, total)
-            data = future.result()
-            if data:
-                _save_fundamentals(sym, data)
-                cached[sym] = data
-            else:
-                yahoo_failures.append(sym)
+    def _fetch_batch(syms, workers, pause_between=0):
+        """Fetch a batch of tickers. Returns list of symbols that failed."""
+        failures = []
+        nonlocal completed
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(fetch_fundamentals_yahoo, sym): sym for sym in syms}
+            for future in as_completed(futures):
+                sym = futures[future]
+                completed += 1
+                if progress_callback:
+                    progress_callback(completed, total)
+                data = future.result()
+                if data:
+                    _save_fundamentals(sym, data)
+                    cached[sym] = data
+                else:
+                    failures.append(sym)
+        if pause_between > 0 and failures:
+            time.sleep(pause_between)
+        return failures
 
-    # Phase 3: Lazy FMP backfill for Yahoo failures
+    # First pass: 6 workers, batches of 50 with 2s pauses
+    yahoo_failures = []
+    batch_size = 50
+    for i in range(0, len(missing), batch_size):
+        batch = missing[i:i + batch_size]
+        fails = _fetch_batch(batch, workers=max_workers)
+        yahoo_failures.extend(fails)
+        if i + batch_size < len(missing):
+            time.sleep(2)
+
+    # Retry pass: failed tickers with 2 workers and 3s pause (gentler on Yahoo)
+    if yahoo_failures:
+        logger.info(f"Retrying {len(yahoo_failures)} Yahoo failures with lower concurrency...")
+        time.sleep(5)
+        still_failing = _fetch_batch(yahoo_failures, workers=2, pause_between=3)
+        yahoo_failures = still_failing
+
+    # Phase 3: FMP backfill for persistent Yahoo failures
     if FMP_API_KEY and yahoo_failures:
         budget = _fmp_remaining()
-        can_process = min(len(yahoo_failures), budget // 6)  # ~6 calls per ticker
+        can_process = min(len(yahoo_failures), budget // 6)
         if can_process > 0:
             logger.info(f"FMP backfill: {can_process}/{len(yahoo_failures)} failures ({budget} calls remaining)")
             for sym in yahoo_failures[:can_process]:
@@ -444,6 +479,7 @@ def run_screen(max_workers: int = 6, progress_callback=None) -> list[dict]:
                 if data:
                     _save_fundamentals(sym, data)
                     cached[sym] = data
+                    yahoo_failures.remove(sym)
 
     # Phase 4: Score with fresh market caps
     results = []
