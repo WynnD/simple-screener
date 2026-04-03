@@ -61,5 +61,5 @@ FMP API key: `kubectl get secret fmp-api -n simple-screener` (created manually, 
 - Full scan takes ~3 minutes (400 pre-filtered tickers), cached for 6 hours.
 - Yahoo screener fields: `grossprofitmargin.lasttwelvemonths`, `netdebtebitda.lasttwelvemonths`, `leveredfreecashflow.lasttwelvemonths` — see `EQUITY_SCREENER_FIELDS` in yfinance source for full list.
 - Yahoo's gross profit definition differs from some data providers (e.g., MELI shows 44.5% vs 50.68% elsewhere). This is a known data source divergence, not a bug.
-- FMP free tier (250 req/day) only supports `/stable/profile` endpoint. Financial statements and ratios require paid plan. The FMP fallback code exists but is non-functional on the current free key.
+- FMP key has full API access (profile, income-statement, cash-flow-statement, balance-sheet-statement all work). Budget: 250 req/day, ~6 calls per ticker. Failed tickers are cached for 7 days to avoid wasting budget.
 - `gunicorn --workers 1` required — screening state is in-process memory.

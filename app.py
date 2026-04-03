@@ -15,6 +15,7 @@ app = Flask(__name__)
 # In-memory state for background screening
 _state = {
     "results": None,
+    "excluded": None,
     "pending": None,
     "timestamp": None,
     "running": False,
@@ -33,6 +34,7 @@ def _load_stale_cache():
             data = json.loads(cache_file.read_text())
             ts = datetime.fromtimestamp(cache_file.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
             _state["results"] = data.get("results", data if isinstance(data, list) else [])
+            _state["excluded"] = data.get("excluded", [])
             _state["pending"] = data.get("pending", [])
             _state["timestamp"] = ts
             logger.info(f"Loaded stale cache: {len(_state['results'])} results from {ts}")
@@ -51,6 +53,7 @@ def _run_background():
     try:
         data, ts = run_screen_cached(max_age_hours=1, progress_callback=_progress_cb)
         _state["results"] = data.get("results", [])
+        _state["excluded"] = data.get("excluded", [])
         _state["pending"] = data.get("pending", [])
         _state["timestamp"] = ts
     except Exception as e:
@@ -181,7 +184,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </div>
 
 <script>
-let sortKey = 'p_fcf', sortAsc = true, data = [], pending = [];
+let sortKey = 'p_fcf', sortAsc = true, data = [], excluded = [], pending = [];
 
 function fmt(val, suffix) {
   if (val === null || val === undefined) return '\u2026';
@@ -225,11 +228,6 @@ function render() {
   tbody.textContent = '';
   sorted.forEach(r => tbody.appendChild(renderRow(r, false)));
 
-  // Append pending rows at the bottom
-  if (pending.length > 0) {
-    pending.forEach(r => tbody.appendChild(renderRow(r, true)));
-  }
-
   document.querySelectorAll('th').forEach(th => {
     th.classList.remove('sorted-asc', 'sorted-desc');
     if (th.dataset.key === sortKey) th.classList.add(sortAsc ? 'sorted-asc' : 'sorted-desc');
@@ -261,9 +259,11 @@ async function poll() {
     document.getElementById('refresh').disabled = false;
     if (s.results) {
       data = s.results;
+      excluded = s.excluded || [];
       pending = s.pending || [];
       let meta = data.length + ' stocks passing';
-      if (pending.length > 0) meta += ' \u00b7 ' + pending.length + ' awaiting data';
+      if (excluded.length > 0) meta += ' \u00b7 ' + excluded.length + ' excluded';
+      if (pending.length > 0) meta += ' \u00b7 ' + pending.length + ' no data';
       meta += ' \u00b7 Updated ' + s.timestamp;
       document.getElementById('meta').textContent = meta;
       render();
@@ -316,6 +316,7 @@ def api_status():
         "progress": _state["progress"],
         "total": _state["total"],
         "results": _state["results"],
+        "excluded": _state["excluded"],
         "pending": _state["pending"],
         "timestamp": _state["timestamp"],
     })
@@ -326,11 +327,13 @@ def api_refresh():
     if _state["running"]:
         return jsonify({"ok": False, "msg": "Already running"})
 
-    # Delete cache to force re-fetch
+    # Delete caches to force full re-fetch
     from pathlib import Path
-    cache_file = Path(__file__).parent / "cache" / "results.json"
-    if cache_file.exists():
-        cache_file.unlink()
+    cache_dir = Path(__file__).parent / "cache"
+    for name in ("results.json", "candidates.json"):
+        f = cache_dir / name
+        if f.exists():
+            f.unlink()
 
     threading.Thread(target=_run_background, daemon=True).start()
     return jsonify({"ok": True})

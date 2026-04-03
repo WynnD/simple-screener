@@ -35,6 +35,7 @@ FUNDAMENTALS_DIR = CACHE_DIR / "fundamentals"
 FUNDAMENTALS_DIR.mkdir(exist_ok=True)
 
 FUNDAMENTALS_MAX_AGE_DAYS = 30
+FMP_FAILURE_CACHE_DAYS = 7  # Don't retry FMP for tickers that failed recently
 FMP_API_KEY = os.environ.get("FMP_API_KEY", "")
 FMP_BASE = "https://financialmodelingprep.com/stable"
 
@@ -61,7 +62,10 @@ def _fmp_remaining() -> int:
 def _fmp_increment(n: int = 1):
     b = _fmp_budget()
     b["used"] += n
-    _fmp_budget_file().write_text(json.dumps(b))
+    f = _fmp_budget_file()
+    # Delete first to work around NFS root_squash overwrite issues
+    f.unlink(missing_ok=True)
+    f.write_text(json.dumps(b))
 
 
 _fmp_last_call = 0.0
@@ -95,6 +99,24 @@ def _fundamentals_path(symbol: str) -> Path:
     return FUNDAMENTALS_DIR / f"{symbol}.json"
 
 
+def _fmp_failure_path(symbol: str) -> Path:
+    return CACHE_DIR / "fmp_failures" / f"{symbol}.fail"
+
+
+def _is_fmp_failure_cached(symbol: str) -> bool:
+    p = _fmp_failure_path(symbol)
+    if not p.exists():
+        return False
+    age_days = (time.time() - p.stat().st_mtime) / 86400
+    return age_days < FMP_FAILURE_CACHE_DAYS
+
+
+def _save_fmp_failure(symbol: str):
+    p = _fmp_failure_path(symbol)
+    p.parent.mkdir(exist_ok=True)
+    p.write_text(datetime.now().isoformat())
+
+
 def _load_fundamentals(symbol: str) -> dict | None:
     """Load cached fundamentals. Returns None if missing or stale."""
     p = _fundamentals_path(symbol)
@@ -110,7 +132,10 @@ def _load_fundamentals(symbol: str) -> dict | None:
 
 
 def _save_fundamentals(symbol: str, data: dict):
-    _fundamentals_path(symbol).write_text(json.dumps(data))
+    p = _fundamentals_path(symbol)
+    # Delete first to work around NFS root_squash overwrite issues
+    p.unlink(missing_ok=True)
+    p.write_text(json.dumps(data))
 
 
 # --- Yahoo screener (server-side pre-filter) ---
@@ -481,25 +506,36 @@ def run_screen(max_workers: int = 6, progress_callback=None) -> list[dict]:
         yahoo_failures = still_failing
 
     # Phase 3: FMP backfill for persistent Yahoo failures
-    if FMP_API_KEY and yahoo_failures:
-        budget = _fmp_remaining()
-        can_process = min(len(yahoo_failures), budget // 6)
-        if can_process > 0:
-            logger.info(f"FMP backfill: {can_process}/{len(yahoo_failures)} failures ({budget} calls remaining)")
-            fmp_successes = 0
-            for sym in yahoo_failures[:can_process]:
-                data = fetch_fundamentals_fmp(sym)
-                if data == "RATE_LIMITED":
-                    logger.warning(f"FMP rate limited after {fmp_successes} tickers, stopping backfill")
-                    break
-                if isinstance(data, dict):
-                    _save_fundamentals(sym, data)
-                    cached[sym] = data
-                    fmp_successes += 1
-            logger.info(f"FMP backfill complete: {fmp_successes} tickers cached")
+    try:
+        if FMP_API_KEY and yahoo_failures:
+            # Skip tickers that already failed FMP recently
+            fmp_candidates = [s for s in yahoo_failures if not _is_fmp_failure_cached(s)]
+            fmp_skipped = len(yahoo_failures) - len(fmp_candidates)
+            budget = _fmp_remaining()
+            can_process = min(len(fmp_candidates), budget // 6)
+            if fmp_skipped > 0:
+                logger.info(f"FMP backfill: skipping {fmp_skipped} tickers with cached failures")
+            if can_process > 0:
+                logger.info(f"FMP backfill: {can_process}/{len(fmp_candidates)} failures ({budget} calls remaining)")
+                fmp_successes = 0
+                for sym in fmp_candidates[:can_process]:
+                    data = fetch_fundamentals_fmp(sym)
+                    if data == "RATE_LIMITED":
+                        logger.warning(f"FMP rate limited after {fmp_successes} tickers, stopping backfill")
+                        break
+                    if isinstance(data, dict):
+                        _save_fundamentals(sym, data)
+                        cached[sym] = data
+                        fmp_successes += 1
+                    else:
+                        _save_fmp_failure(sym)
+                logger.info(f"FMP backfill complete: {fmp_successes} tickers cached")
+    except Exception as e:
+        logger.error(f"FMP backfill failed (non-fatal): {e}")
 
     # Phase 4: Score with fresh market caps
     results = []
+    excluded = []
     pending = []
     candidate_names = {c["symbol"]: c.get("name", c["symbol"]) for c in candidates}
 
@@ -509,21 +545,17 @@ def run_screen(max_workers: int = 6, progress_callback=None) -> list[dict]:
             result = score_ticker(cached[sym], mc)
             if result:
                 results.append(result)
+            else:
+                excluded.append({
+                    "symbol": sym,
+                    "name": cached[sym].get("name", candidate_names.get(sym, sym)),
+                    "source": "excluded",
+                })
         else:
-            # No fundamentals yet — show as pending
             pending.append({
                 "symbol": sym,
                 "name": candidate_names.get(sym, sym),
-                "sector": "",
-                "industry": "",
-                "source": "pending",
-                "market_cap_b": round(mc / 1e9, 2) if mc else None,
-                "gross_margin_pct": None,
-                "fcf_margin_3y_avg_pct": None,
-                "p_fcf": None,
-                "revenue_cagr_pct": None,
-                "ebit_cagr_pct": None,
-                "net_debt_ebitda": None,
+                "source": "no_data",
             })
 
     results.sort(key=lambda x: x["p_fcf"])
@@ -531,12 +563,12 @@ def run_screen(max_workers: int = 6, progress_callback=None) -> list[dict]:
     yahoo_fail_count = len(yahoo_failures)
     fmp_budget_left = _fmp_remaining()
     logger.info(
-        f"Screen complete: {len(results)} passed, {len(pending)} pending, "
-        f"{len(cached)}/{len(symbols)} have fundamentals, "
+        f"Screen complete: {len(results)} passed, {len(excluded)} excluded, "
+        f"{len(pending)} no data, {len(cached)}/{len(symbols)} have fundamentals, "
         f"{yahoo_fail_count} Yahoo failures, "
         f"FMP budget: {fmp_budget_left}/250 remaining"
     )
-    return {"results": results, "pending": pending}
+    return {"results": results, "excluded": excluded, "pending": pending}
 
 
 def run_screen_cached(max_age_hours: int = 1, progress_callback=None) -> tuple[dict, str]:
