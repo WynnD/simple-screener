@@ -373,7 +373,7 @@ def api_status():
         "excluded": _state["excluded"],
         "pending": _state["pending"],
         "timestamp": _state["timestamp"],
-        "metadata": (_load_stale_cache() or _state["metadata"]),
+        "metadata": _state["metadata"],
     })
 
 

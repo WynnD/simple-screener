@@ -71,6 +71,7 @@ def _atomic_write_json(path: Path, data: dict | list):
             tmp_path = Path(tmp.name)
             json.dump(data, tmp, indent=2)
             tmp.write("\n")
+        os.chmod(tmp_path, 0o644)
         tmp_path.replace(path)
         tmp_path = None
     finally:
@@ -145,11 +146,12 @@ def _fmp_budget_file() -> Path:
 
 def _fmp_budget() -> dict:
     f = _fmp_budget_file()
+    today = _utcnow().strftime("%Y-%m-%d")
     if f.exists():
         data = json.loads(f.read_text(encoding="utf-8"))
-        if data.get("date") == datetime.now().strftime("%Y-%m-%d"):
+        if data.get("date") == today:
             return data
-    return {"date": datetime.now().strftime("%Y-%m-%d"), "used": 0}
+    return {"date": today, "used": 0}
 
 
 def _fmp_remaining() -> int:
@@ -188,6 +190,10 @@ def _fmp_get(endpoint: str, params: dict) -> dict | list | str | None:
         if r.status_code == 429:
             logger.warning("FMP rate limited")
             return "RATE_LIMITED"
+        if r.status_code in (401, 403):
+            _fmp_last_transient_error = True
+            logger.warning("FMP %s returned auth/config status %s", endpoint, r.status_code)
+            return None
         if r.status_code >= 500:
             _fmp_last_transient_error = True
         logger.debug("FMP %s returned status %s", endpoint, r.status_code)
