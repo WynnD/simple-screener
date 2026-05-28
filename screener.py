@@ -65,11 +65,20 @@ def _format_mtime(path: Path) -> str:
 
 def _atomic_write_json(path: Path, data: dict | list):
     path.parent.mkdir(exist_ok=True)
-    with NamedTemporaryFile("w", dir=path.parent, delete=False) as tmp:
-        json.dump(data, tmp, indent=2)
-        tmp.write("\n")
-        tmp_path = Path(tmp.name)
-    tmp_path.replace(path)
+    tmp_path = None
+    try:
+        with NamedTemporaryFile("w", dir=path.parent, delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+            json.dump(data, tmp, indent=2)
+            tmp.write("\n")
+        tmp_path.replace(path)
+        tmp_path = None
+    finally:
+        if tmp_path and tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
 
 
 def _write_last_error(message: str):
@@ -644,6 +653,9 @@ def run_screen(max_workers: int = 6, progress_callback=None, force_candidates: b
                     fmp_successes = 0
                     fmp_attempted = 0
                     for sym in fmp_candidates[:can_process]:
+                        if _fmp_remaining() < 6:
+                            logger.warning("Stopping FMP backfill: remaining budget is too low")
+                            break
                         data = fetch_fundamentals_fmp(sym)
                         fmp_attempted += 1
                         if data == "RATE_LIMITED":

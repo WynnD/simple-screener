@@ -22,26 +22,40 @@ _state = {
     "progress": 0,
     "total": 0,
     "metadata": None,
+    "last_loaded_mtime": 0.0,
 }
 
 
 def _load_stale_cache():
-    """Load whatever results exist on disk, regardless of age."""
-    import json, time
-    from datetime import datetime
+    """Load disk cache when the CronJob or manual refresh has updated it."""
+    import json
+    from datetime import datetime, timezone
+
     cache_file = CACHE_DIR / "results.json"
+    stats_file = CACHE_DIR / "run_stats.json"
+    mtime = 0.0
     if cache_file.exists():
-        try:
+        mtime = max(mtime, cache_file.stat().st_mtime)
+    if stats_file.exists():
+        mtime = max(mtime, stats_file.stat().st_mtime)
+
+    if mtime <= 0.0 or _state["last_loaded_mtime"] >= mtime:
+        return _state["metadata"]
+
+    try:
+        if cache_file.exists():
             data = json.loads(cache_file.read_text())
-            ts = datetime.fromtimestamp(cache_file.stat().st_mtime).strftime("%Y-%m-%d %H:%M UTC")
+            ts = datetime.fromtimestamp(cache_file.stat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
             _state["results"] = data.get("results", data if isinstance(data, list) else [])
             _state["excluded"] = data.get("excluded", [])
             _state["pending"] = data.get("pending", [])
             _state["timestamp"] = ts
-            _state["metadata"] = read_cache_metadata()
-            logger.info(f"Loaded stale cache: {len(_state['results'])} results from {ts}")
-        except Exception as e:
-            logger.error(f"Failed to load stale cache: {e}")
+        _state["metadata"] = read_cache_metadata()
+        _state["last_loaded_mtime"] = mtime
+        logger.info(f"Loaded cache: {len(_state['results'] or [])} results")
+    except Exception as e:
+        logger.error(f"Failed to load stale cache: {e}")
+    return _state["metadata"]
 
 
 def _progress_cb(done, total):
@@ -346,6 +360,7 @@ def index():
 
 @app.route("/api/status")
 def api_status():
+    _load_stale_cache()
     return jsonify({
         "running": _state["running"],
         "progress": _state["progress"],
@@ -354,7 +369,7 @@ def api_status():
         "excluded": _state["excluded"],
         "pending": _state["pending"],
         "timestamp": _state["timestamp"],
-        "metadata": read_cache_metadata(),
+        "metadata": (_load_stale_cache() or _state["metadata"]),
     })
 
 
@@ -382,6 +397,7 @@ def health():
 
 @app.route("/readyz")
 def readyz():
-    metadata = read_cache_metadata()
+    _load_stale_cache()
+    metadata = _state["metadata"] or read_cache_metadata()
     status = 200 if not metadata.get("degraded") else 503
     return jsonify(metadata), status
