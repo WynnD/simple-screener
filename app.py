@@ -5,12 +5,15 @@ import threading
 
 from flask import Flask, jsonify, render_template_string
 
-from screener import run_screen_cached, CACHE_DIR
+from screener import CACHE_DIR, read_cache_metadata, run_screen_cached
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+
+_cache_lock = threading.Lock()
+
 
 # In-memory state for background screening
 _state = {
@@ -21,25 +24,42 @@ _state = {
     "running": False,
     "progress": 0,
     "total": 0,
+    "metadata": None,
+    "last_loaded_mtime": 0.0,
 }
 
 
 def _load_stale_cache():
-    """Load whatever results exist on disk, regardless of age."""
-    import json, time
-    from datetime import datetime
+    """Load disk cache when the CronJob or manual refresh has updated it."""
+    import json
+    from datetime import datetime, timezone
+
     cache_file = CACHE_DIR / "results.json"
+    stats_file = CACHE_DIR / "run_stats.json"
+    mtime = 0.0
     if cache_file.exists():
+        mtime = max(mtime, cache_file.stat().st_mtime)
+    if stats_file.exists():
+        mtime = max(mtime, stats_file.stat().st_mtime)
+
+    with _cache_lock:
+        if mtime <= 0.0 or _state["last_loaded_mtime"] >= mtime:
+            return _state["metadata"]
+
         try:
-            data = json.loads(cache_file.read_text())
-            ts = datetime.fromtimestamp(cache_file.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-            _state["results"] = data.get("results", data if isinstance(data, list) else [])
-            _state["excluded"] = data.get("excluded", [])
-            _state["pending"] = data.get("pending", [])
-            _state["timestamp"] = ts
-            logger.info(f"Loaded stale cache: {len(_state['results'])} results from {ts}")
+            if cache_file.exists():
+                data = json.loads(cache_file.read_text(encoding="utf-8"))
+                ts = datetime.fromtimestamp(cache_file.stat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                _state["results"] = data.get("results", data if isinstance(data, list) else [])
+                _state["excluded"] = data.get("excluded", [])
+                _state["pending"] = data.get("pending", [])
+                _state["timestamp"] = ts
+            _state["metadata"] = read_cache_metadata()
+            _state["last_loaded_mtime"] = mtime
+            logger.info(f"Loaded cache: {len(_state['results'] or [])} results")
         except Exception as e:
             logger.error(f"Failed to load stale cache: {e}")
+        return _state["metadata"]
 
 
 def _progress_cb(done, total):
@@ -51,21 +71,22 @@ def _run_background():
     _state["running"] = True
     _state["progress"] = 0
     try:
-        data, ts = run_screen_cached(max_age_hours=1, progress_callback=_progress_cb)
+        data, ts = run_screen_cached(max_age_hours=1, progress_callback=_progress_cb, force=True)
         _state["results"] = data.get("results", [])
         _state["excluded"] = data.get("excluded", [])
         _state["pending"] = data.get("pending", [])
         _state["timestamp"] = ts
+        _state["metadata"] = read_cache_metadata()
     except Exception as e:
         logger.error(f"Screen failed: {e}")
+        _state["metadata"] = read_cache_metadata()
     finally:
         _state["running"] = False
 
 
-# Load cached results immediately so the UI has data right away
+# Load cached results immediately so the UI has data right away. Refresh ownership
+# belongs to the Kubernetes CronJob; the web process only refreshes on demand.
 _load_stale_cache()
-# Then refresh in background
-threading.Thread(target=_run_background, daemon=True).start()
 
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
@@ -86,7 +107,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     padding: 2rem; max-width: 1400px; margin: 0 auto;
   }
   h1 { font-size: 1.5rem; font-weight: 600; margin-bottom: 0.25rem; }
-  .subtitle { color: var(--muted); font-size: 0.85rem; margin-bottom: 1.5rem; }
+  .subtitle { color: var(--muted); font-size: 0.85rem; margin-bottom: 0.75rem; }
+  .health {
+    display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 1.5rem;
+    font-size: 0.8rem;
+  }
+  .pill { border: 1px solid var(--border); border-radius: 999px; padding: 0.2rem 0.65rem; color: var(--muted); }
+  .pill.ok { color: var(--green); border-color: rgba(34, 197, 94, 0.35); }
+  .pill.warn { color: #f59e0b; border-color: rgba(245, 158, 11, 0.35); }
+  .pill.bad { color: var(--red); border-color: rgba(239, 68, 68, 0.35); }
   .criteria {
     display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 1.5rem;
   }
@@ -150,6 +179,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <button class="btn" onclick="exportCsv()">Export CSV</button>
   </div>
   <p class="subtitle" id="meta">Loading...</p>
+  <div class="health" id="health"></div>
   <div class="criteria">
     <span class="chip">Mkt Cap &gt; $3B</span>
     <span class="chip">FCF Margin 3Y Avg &gt; 15%</span>
@@ -215,6 +245,27 @@ function renderRow(r, isPending) {
   return tr;
 }
 
+function renderHealth(metadata) {
+  const el = document.getElementById('health');
+  el.textContent = '';
+  if (!metadata) return;
+  const stats = metadata.run_stats || {};
+  const pills = [
+    { text: metadata.degraded ? 'DEGRADED' : 'fresh enough', cls: metadata.degraded ? 'bad' : 'ok' },
+    { text: metadata.data_age_hours == null ? 'no age' : 'age ' + metadata.data_age_hours + 'h', cls: metadata.degraded ? 'warn' : 'ok' },
+    { text: 'FMP left ' + (stats.fmp_budget_remaining ?? 'unknown'), cls: (stats.fmp_budget_remaining ?? 999) < 50 ? 'warn' : 'ok' },
+    { text: 'FMP tried ' + (stats.fmp_attempted ?? 0) + ' / hit ' + (stats.fmp_successes ?? 0), cls: '' },
+  ];
+  if (metadata.last_error) pills.push({ text: 'last error: ' + metadata.last_error.error, cls: 'bad' });
+  (metadata.degraded_reasons || []).forEach(r => pills.push({ text: r, cls: 'warn' }));
+  pills.forEach(p => {
+    const span = document.createElement('span');
+    span.className = 'pill ' + p.cls;
+    span.textContent = p.text;
+    el.appendChild(span);
+  });
+}
+
 function render() {
   const sorted = [...data].sort((a, b) => {
     let va = a[sortKey], vb = b[sortKey];
@@ -264,11 +315,13 @@ async function poll() {
       let meta = data.length + ' stocks passing';
       if (excluded.length > 0) meta += ' \u00b7 ' + excluded.length + ' excluded';
       if (pending.length > 0) meta += ' \u00b7 ' + pending.length + ' no data';
-      meta += ' \u00b7 Updated ' + s.timestamp;
+      meta += ' · Updated ' + s.timestamp;
       document.getElementById('meta').textContent = meta;
+      renderHealth(s.metadata);
       render();
     } else {
       document.getElementById('meta').textContent = 'No results yet. Click Refresh.';
+      renderHealth(s.metadata);
     }
   }
 }
@@ -311,6 +364,7 @@ def index():
 
 @app.route("/api/status")
 def api_status():
+    _load_stale_cache()
     return jsonify({
         "running": _state["running"],
         "progress": _state["progress"],
@@ -319,6 +373,7 @@ def api_status():
         "excluded": _state["excluded"],
         "pending": _state["pending"],
         "timestamp": _state["timestamp"],
+        "metadata": _state["metadata"],
     })
 
 
@@ -342,3 +397,11 @@ def api_refresh():
 @app.route("/health")
 def health():
     return "ok"
+
+
+@app.route("/readyz")
+def readyz():
+    _load_stale_cache()
+    metadata = _state["metadata"] or read_cache_metadata()
+    status = 200 if not metadata.get("degraded") else 503
+    return jsonify(metadata), status

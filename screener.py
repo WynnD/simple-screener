@@ -10,17 +10,19 @@ Pipeline:
 1. Yahoo screener (server-side): pre-filter to ~400 candidates
 2. Load cached fundamentals, identify missing tickers
 3. Fetch missing from Yahoo per-ticker (bulk of work, but only once per 30 days)
-4. Lazy-load from FMP for persistent Yahoo failures (respects 250/day budget)
+4. Lazy-load from FMP for persistent Yahoo failures (respects daily budget)
 5. Combine fundamentals + fresh market cap → apply all filters
 """
 
+import argparse
 import json
 import logging
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 import pandas as pd
 import requests
@@ -29,15 +31,111 @@ from yfinance.screener import EquityQuery, screen
 
 logger = logging.getLogger(__name__)
 
-CACHE_DIR = Path(__file__).parent / "cache"
+CACHE_DIR = Path(os.environ.get("SCREENER_CACHE_DIR", Path(__file__).parent / "cache"))
 CACHE_DIR.mkdir(exist_ok=True)
 FUNDAMENTALS_DIR = CACHE_DIR / "fundamentals"
 FUNDAMENTALS_DIR.mkdir(exist_ok=True)
 
-FUNDAMENTALS_MAX_AGE_DAYS = 30
-FMP_FAILURE_CACHE_DAYS = 7  # Don't retry FMP for tickers that failed recently
+FUNDAMENTALS_MAX_AGE_DAYS = int(os.environ.get("FUNDAMENTALS_MAX_AGE_DAYS", "30"))
+FMP_FAILURE_CACHE_DAYS = int(os.environ.get("FMP_FAILURE_CACHE_DAYS", "30"))
+FMP_DAILY_BUDGET = int(os.environ.get("FMP_DAILY_BUDGET", "250"))
+FMP_MAX_TICKERS_PER_RUN = int(os.environ.get("FMP_MAX_TICKERS_PER_RUN", "20"))
+FMP_MIN_MARKET_CAP = int(os.environ.get("FMP_MIN_MARKET_CAP", "5000000000"))
+FMP_MIN_SUCCESS_RATE = float(os.environ.get("FMP_MIN_SUCCESS_RATE", "0.10"))
+FMP_MIN_ATTEMPTS_BEFORE_STOP = int(os.environ.get("FMP_MIN_ATTEMPTS_BEFORE_STOP", "10"))
+DATA_STALE_HOURS = float(os.environ.get("DATA_STALE_HOURS", "84"))
 FMP_API_KEY = os.environ.get("FMP_API_KEY", "")
 FMP_BASE = "https://financialmodelingprep.com/stable"
+
+RUN_STATS_FILE = CACHE_DIR / "run_stats.json"
+LAST_ERROR_FILE = CACHE_DIR / "last_error.json"
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _iso_now() -> str:
+    return _utcnow().isoformat().replace("+00:00", "Z")
+
+
+def _format_mtime(path: Path) -> str:
+    return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _atomic_write_json(path: Path, data: dict | list):
+    path.parent.mkdir(exist_ok=True)
+    tmp_path = None
+    try:
+        with NamedTemporaryFile("w", dir=path.parent, delete=False, encoding="utf-8") as tmp:
+            tmp_path = Path(tmp.name)
+            json.dump(data, tmp, indent=2)
+            tmp.write("\n")
+        os.chmod(tmp_path, 0o644)
+        tmp_path.replace(path)
+        tmp_path = None
+    finally:
+        if tmp_path and tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+
+
+def _write_last_error(message: str):
+    _atomic_write_json(LAST_ERROR_FILE, {"at": _iso_now(), "error": message})
+
+
+def _clear_last_error():
+    LAST_ERROR_FILE.unlink(missing_ok=True)
+
+
+def read_last_error() -> dict | None:
+    try:
+        if LAST_ERROR_FILE.exists():
+            return json.loads(LAST_ERROR_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {"error": "failed to read last_error.json"}
+    return None
+
+
+def read_run_stats() -> dict:
+    try:
+        if RUN_STATS_FILE.exists():
+            return json.loads(RUN_STATS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {"error": "failed to read run_stats.json"}
+    return {}
+
+
+def read_cache_metadata() -> dict:
+    results_file = CACHE_DIR / "results.json"
+    stats = read_run_stats()
+    meta = {
+        "cache_dir": str(CACHE_DIR),
+        "has_results": results_file.exists(),
+        "data_age_hours": None,
+        "last_success_at": stats.get("last_success_at"),
+        "last_attempt_at": stats.get("last_attempt_at"),
+        "last_error": read_last_error(),
+        "run_stats": stats,
+        "degraded": False,
+        "degraded_reasons": [],
+    }
+    if results_file.exists():
+        age_hours = (time.time() - results_file.stat().st_mtime) / 3600
+        meta["data_age_hours"] = round(age_hours, 2)
+        meta["timestamp"] = _format_mtime(results_file)
+        if age_hours > DATA_STALE_HOURS:
+            meta["degraded"] = True
+            meta["degraded_reasons"].append(f"results older than {DATA_STALE_HOURS:g} hours")
+    else:
+        meta["degraded"] = True
+        meta["degraded_reasons"].append("no results cache")
+    if meta["last_error"]:
+        meta["degraded"] = True
+        meta["degraded_reasons"].append("last refresh failed")
+    return meta
 
 
 # --- FMP budget tracking (persisted across restarts) ---
@@ -48,36 +146,40 @@ def _fmp_budget_file() -> Path:
 
 def _fmp_budget() -> dict:
     f = _fmp_budget_file()
+    today = _utcnow().strftime("%Y-%m-%d")
     if f.exists():
-        data = json.loads(f.read_text())
-        if data.get("date") == datetime.now().strftime("%Y-%m-%d"):
+        data = json.loads(f.read_text(encoding="utf-8"))
+        if data.get("date") == today:
             return data
-    return {"date": datetime.now().strftime("%Y-%m-%d"), "used": 0}
+    return {"date": today, "used": 0}
 
 
 def _fmp_remaining() -> int:
-    return max(0, 250 - _fmp_budget()["used"])
+    return max(0, FMP_DAILY_BUDGET - _fmp_budget()["used"])
 
 
 def _fmp_increment(n: int = 1):
     b = _fmp_budget()
     b["used"] += n
-    f = _fmp_budget_file()
-    # Delete first to work around NFS root_squash overwrite issues
-    f.unlink(missing_ok=True)
-    f.write_text(json.dumps(b))
+    _atomic_write_json(_fmp_budget_file(), b)
 
 
 _fmp_last_call = 0.0
+_fmp_last_transient_error = False
 
-def _fmp_get(endpoint: str, params: dict) -> dict | list | None:
-    global _fmp_last_call
+def _fmp_had_transient_error() -> bool:
+    return _fmp_last_transient_error
+
+def _fmp_get(endpoint: str, params: dict) -> dict | list | str | None:
+    global _fmp_last_call, _fmp_last_transient_error
+    _fmp_last_transient_error = False
     if not FMP_API_KEY or _fmp_remaining() <= 0:
         return None
-    # Rate limit: max 5 calls/sec (FMP free tier limit)
+    # Rate limit: stay comfortably below FMP free-tier minute limits.
     elapsed = time.time() - _fmp_last_call
     if elapsed < 0.3:
         time.sleep(0.3 - elapsed)
+    params = dict(params)
     params["apikey"] = FMP_API_KEY
     try:
         r = requests.get(f"{FMP_BASE}/{endpoint}", params=params, timeout=10)
@@ -86,10 +188,18 @@ def _fmp_get(endpoint: str, params: dict) -> dict | list | None:
         if r.status_code == 200:
             return r.json()
         if r.status_code == 429:
-            logger.warning(f"FMP rate limited")
+            logger.warning("FMP rate limited")
             return "RATE_LIMITED"
-    except Exception:
-        pass
+        if r.status_code in (401, 403):
+            _fmp_last_transient_error = True
+            logger.warning("FMP %s returned auth/config status %s", endpoint, r.status_code)
+            return None
+        if r.status_code >= 500:
+            _fmp_last_transient_error = True
+        logger.debug("FMP %s returned status %s", endpoint, r.status_code)
+    except Exception as e:
+        _fmp_last_transient_error = True
+        logger.debug("FMP %s error: %s", endpoint, e)
     return None
 
 
@@ -114,7 +224,7 @@ def _is_fmp_failure_cached(symbol: str) -> bool:
 def _save_fmp_failure(symbol: str):
     p = _fmp_failure_path(symbol)
     p.parent.mkdir(exist_ok=True)
-    p.write_text(datetime.now().isoformat())
+    p.write_text(_iso_now(), encoding="utf-8")
 
 
 def _load_fundamentals(symbol: str) -> dict | None:
@@ -126,28 +236,25 @@ def _load_fundamentals(symbol: str) -> dict | None:
     if age_days > FUNDAMENTALS_MAX_AGE_DAYS:
         return None
     try:
-        return json.loads(p.read_text())
+        return json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         return None
 
 
 def _save_fundamentals(symbol: str, data: dict):
-    p = _fundamentals_path(symbol)
-    # Delete first to work around NFS root_squash overwrite issues
-    p.unlink(missing_ok=True)
-    p.write_text(json.dumps(data))
+    _atomic_write_json(_fundamentals_path(symbol), data)
 
 
 # --- Yahoo screener (server-side pre-filter) ---
 
-def get_candidates() -> list[dict]:
+def get_candidates(force_refresh: bool = False) -> list[dict]:
     """Yahoo screener: returns list of {symbol, marketCap} for pre-filtered stocks."""
     cache_file = CACHE_DIR / "candidates.json"
-    if cache_file.exists():
+    if cache_file.exists() and not force_refresh:
         age = time.time() - cache_file.stat().st_mtime
         if age < 86400:
-            data = json.loads(cache_file.read_text())
-            logger.info(f"Loaded {len(data)} cached candidates")
+            data = json.loads(cache_file.read_text(encoding="utf-8"))
+            logger.info("Loaded %s cached candidates", len(data))
             return data
 
     q = EquityQuery("and", [
@@ -180,8 +287,8 @@ def get_candidates() -> list[dict]:
             break
         time.sleep(0.2)
 
-    cache_file.write_text(json.dumps(candidates))
-    logger.info(f"Fetched {len(candidates)} pre-filtered candidates")
+    _atomic_write_json(cache_file, candidates)
+    logger.info("Fetched %s pre-filtered candidates", len(candidates))
     return candidates
 
 
@@ -289,7 +396,7 @@ def fetch_fundamentals_yahoo(symbol: str) -> dict | None:
             "sector": info.get("sector", ""),
             "industry": info.get("industry", ""),
             "source": "yahoo",
-            "fetched_at": datetime.now().isoformat(),
+            "fetched_at": _iso_now(),
             # Static fundamentals (change quarterly)
             "ttm_revenue": ttm_revenue,
             "ttm_gross_profit": ttm_gross_profit,
@@ -303,14 +410,15 @@ def fetch_fundamentals_yahoo(symbol: str) -> dict | None:
             "net_debt_ebitda": round(net_debt / ttm_ebitda, 1) if ttm_ebitda and ttm_ebitda > 0 else 0.0,
         }
     except Exception as e:
-        logger.debug(f"{symbol}: yahoo error - {e}")
+        logger.debug("%s: yahoo error - %s", symbol, e)
         return None
 
 
 def fetch_fundamentals_fmp(symbol: str) -> dict | str | None:
     """Fetch fundamentals from FMP. Costs ~6 API calls.
 
-    Returns dict on success, "RATE_LIMITED" if throttled, None on data error.
+    Returns dict on success, "RATE_LIMITED" if throttled, "TRANSIENT_ERROR" for temporary
+    network/server errors, None on persistent data errors.
     """
     if _fmp_remaining() < 6:
         return None
@@ -318,6 +426,8 @@ def fetch_fundamentals_fmp(symbol: str) -> dict | str | None:
     profile = _fmp_get("profile", {"symbol": symbol})
     if profile == "RATE_LIMITED":
         return "RATE_LIMITED"
+    if _fmp_had_transient_error():
+        return "TRANSIENT_ERROR"
     if not profile or not isinstance(profile, list) or not profile:
         return None
     profile = profile[0]
@@ -333,6 +443,8 @@ def fetch_fundamentals_fmp(symbol: str) -> dict | str | None:
         data = _fmp_get(ep, params)
         if data == "RATE_LIMITED":
             return "RATE_LIMITED"
+        if _fmp_had_transient_error():
+            return "TRANSIENT_ERROR"
         results.append(data)
 
     inc, cf, q_inc, q_cf = results
@@ -353,6 +465,8 @@ def fetch_fundamentals_fmp(symbol: str) -> dict | str | None:
 
     # Net Debt from most recent balance sheet
     bs = _fmp_get("balance-sheet-statement", {"symbol": symbol, "limit": "1"})
+    if _fmp_had_transient_error():
+        return "TRANSIENT_ERROR"
     net_debt = 0.0
     if bs and isinstance(bs, list) and bs:
         net_debt = bs[0].get("netDebt", 0) or 0
@@ -388,7 +502,7 @@ def fetch_fundamentals_fmp(symbol: str) -> dict | str | None:
         "sector": profile.get("sector", ""),
         "industry": profile.get("industry", ""),
         "source": "fmp",
-        "fetched_at": datetime.now().isoformat(),
+        "fetched_at": _iso_now(),
         "ttm_revenue": ttm_revenue,
         "ttm_gross_profit": ttm_gross_profit,
         "ttm_ebitda": ttm_ebitda,
@@ -441,149 +555,251 @@ def score_ticker(fundamentals: dict, market_cap: float) -> dict | None:
     return result
 
 
-def run_screen(max_workers: int = 6, progress_callback=None) -> list[dict]:
+def _rank_fmp_candidates(yahoo_failures: list[str], candidates: list[dict]) -> list[str]:
+    """Spend scarce FMP calls on larger unresolved candidates first."""
+    by_symbol = {c["symbol"]: c for c in candidates}
+    ranked = []
+    for sym in yahoo_failures:
+        c = by_symbol.get(sym, {})
+        market_cap = c.get("marketCap") or 0
+        if market_cap >= FMP_MIN_MARKET_CAP and not _is_fmp_failure_cached(sym):
+            ranked.append((market_cap, sym))
+    ranked.sort(reverse=True)
+    return [sym for _, sym in ranked]
+
+
+def run_screen(max_workers: int = 6, progress_callback=None, force_candidates: bool = False) -> dict:
     """Full screening run with caching."""
-    candidates = get_candidates()
-    market_caps = refresh_market_caps(candidates)
-    symbols = [c["symbol"] for c in candidates]
-    logger.info(f"Screening {len(symbols)} pre-filtered candidates...")
+    attempt_at = _iso_now()
+    stats = {
+        "last_attempt_at": attempt_at,
+        "last_success_at": None,
+        "candidates": 0,
+        "cache_hits": 0,
+        "cache_misses": 0,
+        "yahoo_failures": 0,
+        "fmp_candidates": 0,
+        "fmp_attempted": 0,
+        "fmp_successes": 0,
+        "fmp_transient_errors": 0,
+        "fmp_budget_used": _fmp_budget().get("used", 0),
+        "fmp_budget_remaining": _fmp_remaining(),
+        "results": 0,
+        "excluded": 0,
+        "pending": 0,
+    }
+    _atomic_write_json(RUN_STATS_FILE, stats)
 
-    # Phase 1: Load cached fundamentals, identify missing
-    cached = {}
-    missing = []
-    for sym in symbols:
-        f = _load_fundamentals(sym)
-        if f:
-            cached[sym] = f
-        else:
-            missing.append(sym)
-
-    logger.info(f"Cache: {len(cached)} hit, {len(missing)} miss")
-
-    # Phase 2: Fetch missing from Yahoo in batches to avoid rate limits
-    completed = len(cached)
-    total = len(symbols)
-
-    if progress_callback:
-        progress_callback(completed, total)
-
-    def _fetch_batch(syms, workers, pause_between=0):
-        """Fetch a batch of tickers. Returns list of symbols that failed."""
-        failures = []
-        nonlocal completed
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(fetch_fundamentals_yahoo, sym): sym for sym in syms}
-            for future in as_completed(futures):
-                sym = futures[future]
-                completed += 1
-                if progress_callback:
-                    progress_callback(completed, total)
-                data = future.result()
-                if data:
-                    _save_fundamentals(sym, data)
-                    cached[sym] = data
-                else:
-                    failures.append(sym)
-        if pause_between > 0 and failures:
-            time.sleep(pause_between)
-        return failures
-
-    # First pass: 6 workers, batches of 50 with 2s pauses
-    yahoo_failures = []
-    batch_size = 50
-    for i in range(0, len(missing), batch_size):
-        batch = missing[i:i + batch_size]
-        fails = _fetch_batch(batch, workers=max_workers)
-        yahoo_failures.extend(fails)
-        if i + batch_size < len(missing):
-            time.sleep(2)
-
-    # Retry pass: failed tickers with 2 workers and 3s pause (gentler on Yahoo)
-    if yahoo_failures:
-        logger.info(f"Retrying {len(yahoo_failures)} Yahoo failures with lower concurrency...")
-        time.sleep(5)
-        still_failing = _fetch_batch(yahoo_failures, workers=2, pause_between=3)
-        yahoo_failures = still_failing
-
-    # Phase 3: FMP backfill for persistent Yahoo failures
     try:
-        if FMP_API_KEY and yahoo_failures:
-            # Skip tickers that already failed FMP recently
-            fmp_candidates = [s for s in yahoo_failures if not _is_fmp_failure_cached(s)]
-            fmp_skipped = len(yahoo_failures) - len(fmp_candidates)
-            budget = _fmp_remaining()
-            can_process = min(len(fmp_candidates), budget // 6)
-            if fmp_skipped > 0:
-                logger.info(f"FMP backfill: skipping {fmp_skipped} tickers with cached failures")
-            if can_process > 0:
-                logger.info(f"FMP backfill: {can_process}/{len(fmp_candidates)} failures ({budget} calls remaining)")
-                fmp_successes = 0
-                for sym in fmp_candidates[:can_process]:
-                    data = fetch_fundamentals_fmp(sym)
-                    if data == "RATE_LIMITED":
-                        logger.warning(f"FMP rate limited after {fmp_successes} tickers, stopping backfill")
-                        break
-                    if isinstance(data, dict):
+        candidates = get_candidates(force_refresh=force_candidates)
+        market_caps = refresh_market_caps(candidates)
+        symbols = [c["symbol"] for c in candidates]
+        stats["candidates"] = len(symbols)
+        logger.info("Screening %s pre-filtered candidates...", len(symbols))
+
+        # Phase 1: Load cached fundamentals, identify missing
+        cached = {}
+        missing = []
+        for sym in symbols:
+            f = _load_fundamentals(sym)
+            if f:
+                cached[sym] = f
+            else:
+                missing.append(sym)
+
+        stats["cache_hits"] = len(cached)
+        stats["cache_misses"] = len(missing)
+        logger.info("Cache: %s hit, %s miss", len(cached), len(missing))
+
+        # Phase 2: Fetch missing from Yahoo in batches to avoid rate limits
+        completed = len(cached)
+        total = len(symbols)
+
+        if progress_callback:
+            progress_callback(completed, total)
+
+        def _fetch_batch(syms, workers, pause_between=0):
+            """Fetch a batch of tickers. Returns list of symbols that failed."""
+            failures = []
+            nonlocal completed
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {pool.submit(fetch_fundamentals_yahoo, sym): sym for sym in syms}
+                for future in as_completed(futures):
+                    sym = futures[future]
+                    completed += 1
+                    if progress_callback:
+                        progress_callback(completed, total)
+                    data = future.result()
+                    if data:
                         _save_fundamentals(sym, data)
                         cached[sym] = data
-                        fmp_successes += 1
                     else:
-                        _save_fmp_failure(sym)
-                logger.info(f"FMP backfill complete: {fmp_successes} tickers cached")
-    except Exception as e:
-        logger.error(f"FMP backfill failed (non-fatal): {e}")
+                        failures.append(sym)
+            if pause_between > 0 and failures:
+                time.sleep(pause_between)
+            return failures
 
-    # Phase 4: Score with fresh market caps
-    results = []
-    excluded = []
-    pending = []
-    candidate_names = {c["symbol"]: c.get("name", c["symbol"]) for c in candidates}
+        # First pass: 6 workers, batches of 50 with 2s pauses
+        yahoo_failures = []
+        batch_size = 50
+        for i in range(0, len(missing), batch_size):
+            batch = missing[i:i + batch_size]
+            fails = _fetch_batch(batch, workers=max_workers)
+            yahoo_failures.extend(fails)
+            if i + batch_size < len(missing):
+                time.sleep(2)
 
-    for sym in symbols:
-        mc = market_caps.get(sym, 0)
-        if sym in cached:
-            result = score_ticker(cached[sym], mc)
-            if result:
-                results.append(result)
+        # Retry pass: failed tickers with 2 workers and 3s pause (gentler on Yahoo)
+        if yahoo_failures:
+            logger.info("Retrying %s Yahoo failures with lower concurrency...", len(yahoo_failures))
+            time.sleep(5)
+            still_failing = _fetch_batch(yahoo_failures, workers=2, pause_between=3)
+            yahoo_failures = still_failing
+
+        stats["yahoo_failures"] = len(yahoo_failures)
+
+        # Phase 3: FMP backfill for persistent Yahoo failures. Keep this cheap.
+        try:
+            if FMP_API_KEY and yahoo_failures:
+                fmp_candidates = _rank_fmp_candidates(yahoo_failures, candidates)
+                budget = _fmp_remaining()
+                can_process = min(len(fmp_candidates), budget // 6, FMP_MAX_TICKERS_PER_RUN)
+                stats["fmp_candidates"] = len(fmp_candidates)
+                if can_process > 0:
+                    logger.info(
+                        "FMP backfill: %s/%s prioritized failures (%s calls remaining)",
+                        can_process,
+                        len(fmp_candidates),
+                        budget,
+                    )
+                    fmp_successes = 0
+                    fmp_attempted = 0
+                    for sym in fmp_candidates[:can_process]:
+                        if _fmp_remaining() < 6:
+                            logger.warning("Stopping FMP backfill: remaining budget is too low")
+                            break
+                        data = fetch_fundamentals_fmp(sym)
+                        fmp_attempted += 1
+                        if data == "RATE_LIMITED":
+                            logger.warning("FMP rate limited after %s tickers, stopping backfill", fmp_successes)
+                            break
+                        if data == "TRANSIENT_ERROR":
+                            stats["fmp_transient_errors"] = stats.get("fmp_transient_errors", 0) + 1
+                            logger.warning(
+                                "Stopping FMP backfill after transient error for %s; not caching failure",
+                                sym,
+                            )
+                            break
+                        if isinstance(data, dict):
+                            _save_fundamentals(sym, data)
+                            cached[sym] = data
+                            fmp_successes += 1
+                        else:
+                            _save_fmp_failure(sym)
+
+                        if fmp_attempted >= FMP_MIN_ATTEMPTS_BEFORE_STOP:
+                            success_rate = fmp_successes / fmp_attempted
+                            if success_rate < FMP_MIN_SUCCESS_RATE:
+                                logger.warning(
+                                    "Stopping FMP backfill early: %s/%s successes below %.0f%% threshold",
+                                    fmp_successes,
+                                    fmp_attempted,
+                                    FMP_MIN_SUCCESS_RATE * 100,
+                                )
+                                break
+                    stats["fmp_attempted"] = fmp_attempted
+                    stats["fmp_successes"] = fmp_successes
+                    logger.info("FMP backfill complete: %s/%s tickers cached", fmp_successes, fmp_attempted)
+        except Exception as e:
+            logger.error("FMP backfill failed (non-fatal): %s", e)
+
+        # Phase 4: Score with fresh market caps
+        results = []
+        excluded = []
+        pending = []
+        candidate_names = {c["symbol"]: c.get("name", c["symbol"]) for c in candidates}
+
+        for sym in symbols:
+            mc = market_caps.get(sym, 0)
+            if sym in cached:
+                result = score_ticker(cached[sym], mc)
+                if result:
+                    results.append(result)
+                else:
+                    excluded.append({
+                        "symbol": sym,
+                        "name": cached[sym].get("name", candidate_names.get(sym, sym)),
+                        "source": "excluded",
+                    })
             else:
-                excluded.append({
+                pending.append({
                     "symbol": sym,
-                    "name": cached[sym].get("name", candidate_names.get(sym, sym)),
-                    "source": "excluded",
+                    "name": candidate_names.get(sym, sym),
+                    "source": "no_data",
                 })
-        else:
-            pending.append({
-                "symbol": sym,
-                "name": candidate_names.get(sym, sym),
-                "source": "no_data",
-            })
 
-    results.sort(key=lambda x: x["p_fcf"])
+        results.sort(key=lambda x: x["p_fcf"])
 
-    yahoo_fail_count = len(yahoo_failures)
-    fmp_budget_left = _fmp_remaining()
-    logger.info(
-        f"Screen complete: {len(results)} passed, {len(excluded)} excluded, "
-        f"{len(pending)} no data, {len(cached)}/{len(symbols)} have fundamentals, "
-        f"{yahoo_fail_count} Yahoo failures, "
-        f"FMP budget: {fmp_budget_left}/250 remaining"
-    )
-    return {"results": results, "excluded": excluded, "pending": pending}
+        stats.update({
+            "last_success_at": _iso_now(),
+            "fmp_budget_used": _fmp_budget().get("used", 0),
+            "fmp_budget_remaining": _fmp_remaining(),
+            "results": len(results),
+            "excluded": len(excluded),
+            "pending": len(pending),
+            "fundamentals_available": len(cached),
+        })
+        _atomic_write_json(RUN_STATS_FILE, stats)
+        _clear_last_error()
+        logger.info(
+            "Screen complete: %s passed, %s excluded, %s no data, %s/%s have fundamentals, "
+            "%s Yahoo failures, FMP: %s attempted/%s successes, budget: %s/%s remaining",
+            len(results), len(excluded), len(pending), len(cached), len(symbols), len(yahoo_failures),
+            stats["fmp_attempted"], stats["fmp_successes"], stats["fmp_budget_remaining"], FMP_DAILY_BUDGET,
+        )
+        return {"results": results, "excluded": excluded, "pending": pending}
+    except Exception as e:
+        _write_last_error(str(e))
+        stats["last_error"] = str(e)
+        _atomic_write_json(RUN_STATS_FILE, stats)
+        raise
 
 
-def run_screen_cached(max_age_hours: int = 1, progress_callback=None) -> tuple[dict, str]:
+def run_screen_cached(max_age_hours: int = 1, progress_callback=None, force: bool = False) -> tuple[dict, str]:
     """Returns ({"results": [...], "pending": [...]}, timestamp)."""
     cache_file = CACHE_DIR / "results.json"
 
-    if cache_file.exists():
+    if cache_file.exists() and not force:
         age_hours = (time.time() - cache_file.stat().st_mtime) / 3600
         if age_hours < max_age_hours:
-            cached = json.loads(cache_file.read_text())
-            ts = datetime.fromtimestamp(cache_file.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-            logger.info(f"Using cached results from {ts}")
+            cached = json.loads(cache_file.read_text(encoding="utf-8"))
+            ts = _format_mtime(cache_file)
+            logger.info("Using cached results from %s", ts)
             return cached, ts
 
-    data = run_screen(progress_callback=progress_callback)
-    cache_file.write_text(json.dumps(data, indent=2))
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    data = run_screen(progress_callback=progress_callback, force_candidates=force)
+    _atomic_write_json(cache_file, data)
+    ts = _format_mtime(cache_file)
     return data, ts
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Run the value stock screener refresh")
+    parser.add_argument("--force", action="store_true", help="ignore results/candidate cache and refresh now")
+    parser.add_argument("--max-age-hours", type=int, default=1)
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    data, ts = run_screen_cached(max_age_hours=args.max_age_hours, force=args.force)
+    print(json.dumps({
+        "ok": True,
+        "timestamp": ts,
+        "results": len(data.get("results", [])),
+        "excluded": len(data.get("excluded", [])),
+        "pending": len(data.get("pending", [])),
+        "metadata": read_cache_metadata(),
+    }, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
