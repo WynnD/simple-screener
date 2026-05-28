@@ -12,6 +12,9 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
+_cache_lock = threading.Lock()
+
+
 # In-memory state for background screening
 _state = {
     "results": None,
@@ -39,23 +42,24 @@ def _load_stale_cache():
     if stats_file.exists():
         mtime = max(mtime, stats_file.stat().st_mtime)
 
-    if mtime <= 0.0 or _state["last_loaded_mtime"] >= mtime:
-        return _state["metadata"]
+    with _cache_lock:
+        if mtime <= 0.0 or _state["last_loaded_mtime"] >= mtime:
+            return _state["metadata"]
 
-    try:
-        if cache_file.exists():
-            data = json.loads(cache_file.read_text())
-            ts = datetime.fromtimestamp(cache_file.stat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-            _state["results"] = data.get("results", data if isinstance(data, list) else [])
-            _state["excluded"] = data.get("excluded", [])
-            _state["pending"] = data.get("pending", [])
-            _state["timestamp"] = ts
-        _state["metadata"] = read_cache_metadata()
-        _state["last_loaded_mtime"] = mtime
-        logger.info(f"Loaded cache: {len(_state['results'] or [])} results")
-    except Exception as e:
-        logger.error(f"Failed to load stale cache: {e}")
-    return _state["metadata"]
+        try:
+            if cache_file.exists():
+                data = json.loads(cache_file.read_text(encoding="utf-8"))
+                ts = datetime.fromtimestamp(cache_file.stat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                _state["results"] = data.get("results", data if isinstance(data, list) else [])
+                _state["excluded"] = data.get("excluded", [])
+                _state["pending"] = data.get("pending", [])
+                _state["timestamp"] = ts
+            _state["metadata"] = read_cache_metadata()
+            _state["last_loaded_mtime"] = mtime
+            logger.info(f"Loaded cache: {len(_state['results'] or [])} results")
+        except Exception as e:
+            logger.error(f"Failed to load stale cache: {e}")
+        return _state["metadata"]
 
 
 def _progress_cb(done, total):

@@ -67,7 +67,7 @@ def _atomic_write_json(path: Path, data: dict | list):
     path.parent.mkdir(exist_ok=True)
     tmp_path = None
     try:
-        with NamedTemporaryFile("w", dir=path.parent, delete=False) as tmp:
+        with NamedTemporaryFile("w", dir=path.parent, delete=False, encoding="utf-8") as tmp:
             tmp_path = Path(tmp.name)
             json.dump(data, tmp, indent=2)
             tmp.write("\n")
@@ -92,7 +92,7 @@ def _clear_last_error():
 def read_last_error() -> dict | None:
     try:
         if LAST_ERROR_FILE.exists():
-            return json.loads(LAST_ERROR_FILE.read_text())
+            return json.loads(LAST_ERROR_FILE.read_text(encoding="utf-8"))
     except Exception:
         return {"error": "failed to read last_error.json"}
     return None
@@ -101,7 +101,7 @@ def read_last_error() -> dict | None:
 def read_run_stats() -> dict:
     try:
         if RUN_STATS_FILE.exists():
-            return json.loads(RUN_STATS_FILE.read_text())
+            return json.loads(RUN_STATS_FILE.read_text(encoding="utf-8"))
     except Exception:
         return {"error": "failed to read run_stats.json"}
     return {}
@@ -146,7 +146,7 @@ def _fmp_budget_file() -> Path:
 def _fmp_budget() -> dict:
     f = _fmp_budget_file()
     if f.exists():
-        data = json.loads(f.read_text())
+        data = json.loads(f.read_text(encoding="utf-8"))
         if data.get("date") == datetime.now().strftime("%Y-%m-%d"):
             return data
     return {"date": datetime.now().strftime("%Y-%m-%d"), "used": 0}
@@ -163,9 +163,14 @@ def _fmp_increment(n: int = 1):
 
 
 _fmp_last_call = 0.0
+_fmp_last_transient_error = False
+
+def _fmp_had_transient_error() -> bool:
+    return _fmp_last_transient_error
 
 def _fmp_get(endpoint: str, params: dict) -> dict | list | str | None:
-    global _fmp_last_call
+    global _fmp_last_call, _fmp_last_transient_error
+    _fmp_last_transient_error = False
     if not FMP_API_KEY or _fmp_remaining() <= 0:
         return None
     # Rate limit: stay comfortably below FMP free-tier minute limits.
@@ -183,8 +188,11 @@ def _fmp_get(endpoint: str, params: dict) -> dict | list | str | None:
         if r.status_code == 429:
             logger.warning("FMP rate limited")
             return "RATE_LIMITED"
+        if r.status_code >= 500:
+            _fmp_last_transient_error = True
         logger.debug("FMP %s returned status %s", endpoint, r.status_code)
     except Exception as e:
+        _fmp_last_transient_error = True
         logger.debug("FMP %s error: %s", endpoint, e)
     return None
 
@@ -210,7 +218,7 @@ def _is_fmp_failure_cached(symbol: str) -> bool:
 def _save_fmp_failure(symbol: str):
     p = _fmp_failure_path(symbol)
     p.parent.mkdir(exist_ok=True)
-    p.write_text(_iso_now())
+    p.write_text(_iso_now(), encoding="utf-8")
 
 
 def _load_fundamentals(symbol: str) -> dict | None:
@@ -222,7 +230,7 @@ def _load_fundamentals(symbol: str) -> dict | None:
     if age_days > FUNDAMENTALS_MAX_AGE_DAYS:
         return None
     try:
-        return json.loads(p.read_text())
+        return json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         return None
 
@@ -239,7 +247,7 @@ def get_candidates(force_refresh: bool = False) -> list[dict]:
     if cache_file.exists() and not force_refresh:
         age = time.time() - cache_file.stat().st_mtime
         if age < 86400:
-            data = json.loads(cache_file.read_text())
+            data = json.loads(cache_file.read_text(encoding="utf-8"))
             logger.info("Loaded %s cached candidates", len(data))
             return data
 
@@ -403,7 +411,8 @@ def fetch_fundamentals_yahoo(symbol: str) -> dict | None:
 def fetch_fundamentals_fmp(symbol: str) -> dict | str | None:
     """Fetch fundamentals from FMP. Costs ~6 API calls.
 
-    Returns dict on success, "RATE_LIMITED" if throttled, None on data error.
+    Returns dict on success, "RATE_LIMITED" if throttled, "TRANSIENT_ERROR" for temporary
+    network/server errors, None on persistent data errors.
     """
     if _fmp_remaining() < 6:
         return None
@@ -411,6 +420,8 @@ def fetch_fundamentals_fmp(symbol: str) -> dict | str | None:
     profile = _fmp_get("profile", {"symbol": symbol})
     if profile == "RATE_LIMITED":
         return "RATE_LIMITED"
+    if _fmp_had_transient_error():
+        return "TRANSIENT_ERROR"
     if not profile or not isinstance(profile, list) or not profile:
         return None
     profile = profile[0]
@@ -426,6 +437,8 @@ def fetch_fundamentals_fmp(symbol: str) -> dict | str | None:
         data = _fmp_get(ep, params)
         if data == "RATE_LIMITED":
             return "RATE_LIMITED"
+        if _fmp_had_transient_error():
+            return "TRANSIENT_ERROR"
         results.append(data)
 
     inc, cf, q_inc, q_cf = results
@@ -446,6 +459,8 @@ def fetch_fundamentals_fmp(symbol: str) -> dict | str | None:
 
     # Net Debt from most recent balance sheet
     bs = _fmp_get("balance-sheet-statement", {"symbol": symbol, "limit": "1"})
+    if _fmp_had_transient_error():
+        return "TRANSIENT_ERROR"
     net_debt = 0.0
     if bs and isinstance(bs, list) and bs:
         net_debt = bs[0].get("netDebt", 0) or 0
@@ -560,6 +575,7 @@ def run_screen(max_workers: int = 6, progress_callback=None, force_candidates: b
         "fmp_candidates": 0,
         "fmp_attempted": 0,
         "fmp_successes": 0,
+        "fmp_transient_errors": 0,
         "fmp_budget_used": _fmp_budget().get("used", 0),
         "fmp_budget_remaining": _fmp_remaining(),
         "results": 0,
@@ -661,6 +677,13 @@ def run_screen(max_workers: int = 6, progress_callback=None, force_candidates: b
                         if data == "RATE_LIMITED":
                             logger.warning("FMP rate limited after %s tickers, stopping backfill", fmp_successes)
                             break
+                        if data == "TRANSIENT_ERROR":
+                            stats["fmp_transient_errors"] = stats.get("fmp_transient_errors", 0) + 1
+                            logger.warning(
+                                "Stopping FMP backfill after transient error for %s; not caching failure",
+                                sym,
+                            )
+                            break
                         if isinstance(data, dict):
                             _save_fundamentals(sym, data)
                             cached[sym] = data
@@ -743,7 +766,7 @@ def run_screen_cached(max_age_hours: int = 1, progress_callback=None, force: boo
     if cache_file.exists() and not force:
         age_hours = (time.time() - cache_file.stat().st_mtime) / 3600
         if age_hours < max_age_hours:
-            cached = json.loads(cache_file.read_text())
+            cached = json.loads(cache_file.read_text(encoding="utf-8"))
             ts = _format_mtime(cache_file)
             logger.info("Using cached results from %s", ts)
             return cached, ts
