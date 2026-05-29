@@ -39,7 +39,10 @@ def _write_json_file(path, data):
         with tempfile.NamedTemporaryFile("w", dir=str(path.parent), delete=False, suffix=".tmp", encoding="utf-8") as f:
             tmp_path = _Path(f.name)
             json.dump(data, f, indent=2, sort_keys=True)
-        tmp_path.chmod(0o644)
+        try:
+            tmp_path.chmod(0o644)
+        except OSError:
+            pass
         tmp_path.replace(path)
         tmp_path = None
     finally:
@@ -70,8 +73,12 @@ def _save_hidden_tickers(hidden):
 
 
 def _split_hidden_results(results):
-    with _hidden_tickers_lock:
-        hidden_symbols = _load_hidden_tickers()
+    try:
+        with _hidden_tickers_lock:
+            hidden_symbols = _load_hidden_tickers()
+    except Exception:
+        logger.error("Failed to read hidden tickers, returning empty set")
+        hidden_symbols = set()
     visible_results = []
     hidden_results = []
     for row in results or []:
