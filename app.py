@@ -1,6 +1,8 @@
 """Flask web app for the stock screener."""
 
+import json
 import logging
+import re
 import threading
 
 from flask import Flask, jsonify, render_template_string
@@ -13,6 +15,58 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 _cache_lock = threading.Lock()
+_hidden_tickers_lock = threading.Lock()
+_SYMBOL_RE = re.compile(r"^[A-Z0-9][A-Z0-9.-]{0,11}$")
+
+
+def _hidden_tickers_path():
+    return CACHE_DIR / "hidden_tickers.json"
+
+
+def _normalize_symbol(symbol):
+    normalized = (symbol or "").strip().upper()
+    if not _SYMBOL_RE.fullmatch(normalized):
+        return None
+    return normalized
+
+
+def _write_json_file(path, data):
+    path.parent.mkdir(exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.chmod(0o644)
+    tmp.replace(path)
+
+
+def _load_hidden_tickers():
+    path = _hidden_tickers_path()
+    if not path.exists():
+        return set()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.error("Failed to load hidden tickers: %s", e)
+        return set()
+    if not isinstance(raw, list):
+        return set()
+    return {normalized for item in raw if (normalized := _normalize_symbol(str(item)))}
+
+
+def _save_hidden_tickers(hidden):
+    _write_json_file(_hidden_tickers_path(), sorted(hidden))
+
+
+def _split_hidden_results(results):
+    hidden_symbols = _load_hidden_tickers()
+    visible_results = []
+    hidden_results = []
+    for row in results or []:
+        symbol = _normalize_symbol(str(row.get("symbol", "")))
+        if symbol and symbol in hidden_symbols:
+            hidden_results.append(row)
+        else:
+            visible_results.append(row)
+    return visible_results, hidden_results, sorted(hidden_symbols)
 
 
 # In-memory state for background screening
@@ -162,9 +216,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   }
   .btn:hover { border-color: var(--accent); }
   .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn.small { padding: 0.25rem 0.55rem; font-size: 0.75rem; }
+  .btn.danger { color: #fca5a5; }
+  .btn.restore { color: var(--green); }
   .header-row { display: flex; align-items: center; gap: 1rem; margin-bottom: 0.25rem; }
   .count { color: var(--accent); font-weight: 600; }
   .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .hidden-panel { display: none; margin: 1rem 0 1.5rem; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .hidden-panel.open { display: block; }
+  .hidden-title { padding: 0.65rem 0.75rem; background: var(--surface); color: var(--muted); font-size: 0.85rem; }
+  .actions { text-align: right; }
   @media (max-width: 900px) {
     body { padding: 0.75rem; }
     table { font-size: 0.78rem; }
@@ -177,6 +238,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <h1>Stock Screener</h1>
     <button class="btn" id="refresh" onclick="refresh()">Refresh</button>
     <button class="btn" onclick="exportCsv()">Export CSV</button>
+    <button class="btn" id="hidden-toggle" onclick="toggleHiddenPanel()">Show Hidden (<span id="hidden-count">0</span>)</button>
   </div>
   <p class="subtitle" id="meta">Loading...</p>
   <div class="health" id="health"></div>
@@ -207,21 +269,38 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <th data-key="revenue_cagr_pct" class="num">Rev CAGR 3Y</th>
         <th data-key="ebit_cagr_pct" class="num">EBIT CAGR 3Y</th>
         <th data-key="net_debt_ebitda" class="num">ND/EBITDA</th>
+        <th class="actions">Actions</th>
       </tr>
     </thead>
     <tbody id="tbody"></tbody>
   </table>
   </div>
+  <div class="hidden-panel" id="hidden-panel">
+    <div class="hidden-title">Hidden tickers stay hidden across refreshes. Unhide to return them to the main list.</div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Ticker</th>
+            <th>Name</th>
+            <th>Sector</th>
+            <th class="actions">Actions</th>
+          </tr>
+        </thead>
+        <tbody id="hidden-tbody"></tbody>
+      </table>
+    </div>
+  </div>
 
 <script>
-let sortKey = 'p_fcf', sortAsc = true, data = [], excluded = [], pending = [];
+let sortKey = 'p_fcf', sortAsc = true, data = [], excluded = [], pending = [], hidden = [], hiddenSymbols = [], showHidden = false;
 
 function fmt(val, suffix) {
   if (val === null || val === undefined) return '\u2026';
   return val.toFixed(suffix === 'x2' ? 2 : 1) + (suffix === 'x2' ? 'x' : suffix || '');
 }
 
-function renderRow(r, isPending) {
+function renderRow(r, isPending, isHidden) {
   const tr = document.createElement('tr');
   if (isPending) tr.style.opacity = '0.45';
   const cells = [
@@ -242,6 +321,14 @@ function renderRow(r, isPending) {
     td.textContent = c.text;
     tr.appendChild(td);
   });
+  const actionTd = document.createElement('td');
+  actionTd.className = 'actions';
+  const btn = document.createElement('button');
+  btn.className = 'btn small ' + (isHidden ? 'restore' : 'danger');
+  btn.textContent = isHidden ? 'Unhide' : 'Hide';
+  btn.addEventListener('click', () => toggleHidden(r.symbol, !isHidden));
+  actionTd.appendChild(btn);
+  tr.appendChild(actionTd);
   return tr;
 }
 
@@ -266,6 +353,36 @@ function renderHealth(metadata) {
   });
 }
 
+function renderHiddenRows() {
+  const hiddenTbody = document.getElementById('hidden-tbody');
+  hiddenTbody.textContent = '';
+  const bySymbol = new Map(hidden.map(r => [r.symbol, r]));
+  hiddenSymbols.forEach(symbol => {
+    const row = bySymbol.get(symbol) || { symbol, name: '', sector: '' };
+    const tr = document.createElement('tr');
+    ['symbol', 'name', 'sector'].forEach(key => {
+      const td = document.createElement('td');
+      td.className = key === 'symbol' ? 'sym' : 'name';
+      td.textContent = row[key] || '';
+      tr.appendChild(td);
+    });
+    const actionTd = document.createElement('td');
+    actionTd.className = 'actions';
+    const btn = document.createElement('button');
+    btn.className = 'btn small restore';
+    btn.textContent = 'Unhide';
+    btn.addEventListener('click', () => toggleHidden(symbol, false));
+    actionTd.appendChild(btn);
+    tr.appendChild(actionTd);
+    hiddenTbody.appendChild(tr);
+  });
+  if (hiddenSymbols.length === 0) showHidden = false;
+  document.getElementById('hidden-count').textContent = hiddenSymbols.length;
+  document.getElementById('hidden-toggle').disabled = hiddenSymbols.length === 0;
+  document.getElementById('hidden-toggle').childNodes[0].nodeValue = showHidden ? 'Hide Hidden (' : 'Show Hidden (';
+  document.getElementById('hidden-panel').classList.toggle('open', showHidden && hiddenSymbols.length > 0);
+}
+
 function render() {
   const sorted = [...data].sort((a, b) => {
     let va = a[sortKey], vb = b[sortKey];
@@ -277,15 +394,16 @@ function render() {
   });
   const tbody = document.getElementById('tbody');
   tbody.textContent = '';
-  sorted.forEach(r => tbody.appendChild(renderRow(r, false)));
+  sorted.forEach(r => tbody.appendChild(renderRow(r, false, false)));
+  renderHiddenRows();
 
-  document.querySelectorAll('th').forEach(th => {
+  document.querySelectorAll('th[data-key]').forEach(th => {
     th.classList.remove('sorted-asc', 'sorted-desc');
     if (th.dataset.key === sortKey) th.classList.add(sortAsc ? 'sorted-asc' : 'sorted-desc');
   });
 }
 
-document.querySelectorAll('th').forEach(th => {
+document.querySelectorAll('th[data-key]').forEach(th => {
   th.addEventListener('click', () => {
     if (th.dataset.key === sortKey) sortAsc = !sortAsc;
     else { sortKey = th.dataset.key; sortAsc = true; }
@@ -310,9 +428,12 @@ async function poll() {
     document.getElementById('refresh').disabled = false;
     if (s.results) {
       data = s.results;
+      hidden = s.hidden_results || [];
+      hiddenSymbols = s.hidden_symbols || [];
       excluded = s.excluded || [];
       pending = s.pending || [];
       let meta = data.length + ' stocks passing';
+      if (hiddenSymbols.length > 0) meta += ' · ' + hiddenSymbols.length + ' hidden';
       if (excluded.length > 0) meta += ' \u00b7 ' + excluded.length + ' excluded';
       if (pending.length > 0) meta += ' \u00b7 ' + pending.length + ' no data';
       meta += ' · Updated ' + s.timestamp;
@@ -322,8 +443,25 @@ async function poll() {
     } else {
       document.getElementById('meta').textContent = 'No results yet. Click Refresh.';
       renderHealth(s.metadata);
+      renderHiddenRows();
     }
   }
+}
+
+function toggleHiddenPanel() {
+  showHidden = !showHidden;
+  renderHiddenRows();
+}
+
+async function toggleHidden(symbol, shouldHide) {
+  const method = shouldHide ? 'POST' : 'DELETE';
+  const res = await fetch('/api/hidden/' + encodeURIComponent(symbol), { method });
+  if (!res.ok) {
+    const msg = await res.text();
+    console.warn('Failed to update hidden ticker', symbol, msg);
+    return;
+  }
+  await poll();
 }
 
 async function refresh() {
@@ -365,16 +503,48 @@ def index():
 @app.route("/api/status")
 def api_status():
     _load_stale_cache()
+    visible_results, hidden_results, hidden_symbols = _split_hidden_results(_state["results"])
     return jsonify({
         "running": _state["running"],
         "progress": _state["progress"],
         "total": _state["total"],
-        "results": _state["results"],
+        "results": visible_results,
+        "hidden_results": hidden_results,
+        "hidden_symbols": hidden_symbols,
         "excluded": _state["excluded"],
         "pending": _state["pending"],
         "timestamp": _state["timestamp"],
         "metadata": _state["metadata"],
     })
+
+
+@app.route("/api/hidden")
+def api_hidden_tickers():
+    return jsonify({"hidden_symbols": sorted(_load_hidden_tickers())})
+
+
+@app.route("/api/hidden/<path:symbol>", methods=["POST"])
+def api_hide_ticker(symbol):
+    normalized = _normalize_symbol(symbol)
+    if not normalized:
+        return jsonify({"ok": False, "error": "Invalid ticker symbol"}), 400
+    with _hidden_tickers_lock:
+        hidden = _load_hidden_tickers()
+        hidden.add(normalized)
+        _save_hidden_tickers(hidden)
+    return jsonify({"ok": True, "hidden_symbols": sorted(hidden)})
+
+
+@app.route("/api/hidden/<path:symbol>", methods=["DELETE"])
+def api_unhide_ticker(symbol):
+    normalized = _normalize_symbol(symbol)
+    if not normalized:
+        return jsonify({"ok": False, "error": "Invalid ticker symbol"}), 400
+    with _hidden_tickers_lock:
+        hidden = _load_hidden_tickers()
+        hidden.discard(normalized)
+        _save_hidden_tickers(hidden)
+    return jsonify({"ok": True, "hidden_symbols": sorted(hidden)})
 
 
 @app.route("/api/refresh", methods=["POST"])
