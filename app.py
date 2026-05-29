@@ -31,11 +31,23 @@ def _normalize_symbol(symbol):
 
 
 def _write_json_file(path, data):
+    import tempfile
+    from pathlib import Path as _Path
     path.parent.mkdir(exist_ok=True)
-    tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
-    tmp.chmod(0o644)
-    tmp.replace(path)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile("w", dir=str(path.parent), delete=False, suffix=".tmp", encoding="utf-8") as f:
+            tmp_path = _Path(f.name)
+            json.dump(data, f, indent=2, sort_keys=True)
+        tmp_path.chmod(0o644)
+        tmp_path.replace(path)
+        tmp_path = None
+    finally:
+        if tmp_path and tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
 
 
 def _load_hidden_tickers():
@@ -46,9 +58,10 @@ def _load_hidden_tickers():
         raw = json.loads(path.read_text(encoding="utf-8"))
     except Exception as e:
         logger.error("Failed to load hidden tickers: %s", e)
-        return set()
+        raise
     if not isinstance(raw, list):
-        return set()
+        logger.error("Hidden tickers file is not a list")
+        raise ValueError("Hidden tickers file is not a list")
     return {normalized for item in raw if (normalized := _normalize_symbol(str(item)))}
 
 
@@ -57,7 +70,8 @@ def _save_hidden_tickers(hidden):
 
 
 def _split_hidden_results(results):
-    hidden_symbols = _load_hidden_tickers()
+    with _hidden_tickers_lock:
+        hidden_symbols = _load_hidden_tickers()
     visible_results = []
     hidden_results = []
     for row in results or []:
@@ -238,7 +252,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <h1>Stock Screener</h1>
     <button class="btn" id="refresh" onclick="refresh()">Refresh</button>
     <button class="btn" onclick="exportCsv()">Export CSV</button>
-    <button class="btn" id="hidden-toggle" onclick="toggleHiddenPanel()">Show Hidden (<span id="hidden-count">0</span>)</button>
+    <button class="btn" id="hidden-toggle" onclick="toggleHiddenPanel()"><span id="hidden-toggle-text">Show Hidden</span> (<span id="hidden-count">0</span>)</button>
   </div>
   <p class="subtitle" id="meta">Loading...</p>
   <div class="health" id="health"></div>
@@ -294,6 +308,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
 <script>
 let sortKey = 'p_fcf', sortAsc = true, data = [], excluded = [], pending = [], hidden = [], hiddenSymbols = [], showHidden = false;
+let pollTimeout = null;
 
 function fmt(val, suffix) {
   if (val === null || val === undefined) return '\u2026';
@@ -379,7 +394,7 @@ function renderHiddenRows() {
   if (hiddenSymbols.length === 0) showHidden = false;
   document.getElementById('hidden-count').textContent = hiddenSymbols.length;
   document.getElementById('hidden-toggle').disabled = hiddenSymbols.length === 0;
-  document.getElementById('hidden-toggle').childNodes[0].nodeValue = showHidden ? 'Hide Hidden (' : 'Show Hidden (';
+  document.getElementById('hidden-toggle-text').textContent = showHidden ? 'Hide Hidden' : 'Show Hidden';
   document.getElementById('hidden-panel').classList.toggle('open', showHidden && hiddenSymbols.length > 0);
 }
 
@@ -412,6 +427,10 @@ document.querySelectorAll('th[data-key]').forEach(th => {
 });
 
 async function poll() {
+  if (pollTimeout) {
+    clearTimeout(pollTimeout);
+    pollTimeout = null;
+  }
   const res = await fetch('/api/status');
   const s = await res.json();
 
@@ -422,7 +441,7 @@ async function poll() {
     document.getElementById('progress-text').textContent =
       'Screening ' + s.progress + ' / ' + s.total + ' tickers...';
     document.getElementById('refresh').disabled = true;
-    setTimeout(poll, 2000);
+    pollTimeout = setTimeout(poll, 2000);
   } else {
     document.getElementById('progress-section').style.display = 'none';
     document.getElementById('refresh').disabled = false;
@@ -520,10 +539,12 @@ def api_status():
 
 @app.route("/api/hidden")
 def api_hidden_tickers():
-    return jsonify({"hidden_symbols": sorted(_load_hidden_tickers())})
+    with _hidden_tickers_lock:
+        hidden = sorted(_load_hidden_tickers())
+    return jsonify({"hidden_symbols": hidden})
 
 
-@app.route("/api/hidden/<path:symbol>", methods=["POST"])
+@app.route("/api/hidden/<symbol>", methods=["POST"])
 def api_hide_ticker(symbol):
     normalized = _normalize_symbol(symbol)
     if not normalized:
@@ -535,7 +556,7 @@ def api_hide_ticker(symbol):
     return jsonify({"ok": True, "hidden_symbols": sorted(hidden)})
 
 
-@app.route("/api/hidden/<path:symbol>", methods=["DELETE"])
+@app.route("/api/hidden/<symbol>", methods=["DELETE"])
 def api_unhide_ticker(symbol):
     normalized = _normalize_symbol(symbol)
     if not normalized:

@@ -58,7 +58,7 @@ class HiddenTickersApiTest(unittest.TestCase):
     def test_rejects_invalid_ticker_symbols(self):
         response = self.client.post("/api/hidden/../../etc/passwd")
 
-        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.status_code, 404)
         self.assertFalse((self.cache_dir / "hidden_tickers.json").exists())
 
     def test_index_exposes_hide_and_unhide_controls(self):
